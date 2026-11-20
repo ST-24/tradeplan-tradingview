@@ -1,0 +1,244 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+// 交易規劃助手 v1
+// 功能：圖上點選進場/SL/TP、依風險算手數、R:R 面板、保本、部分止盈、
+//       4 種移動止損（ATR / 擺動高低點 / 均線 / SAR）、觸價警報（JSON 訊息，可接 webhook）
+// 注意：Pine Script 無法直接下單，本指標只做計算、模擬與警報。
+indicator("交易規劃助手 v1", shorttitle = "TradePlan", overlay = true, max_boxes_count = 10, max_lines_count = 20, max_labels_count = 20)
+
+// ───────── ① 交易點位（加到圖上時會要求在圖上點選） ─────────
+G_LV = "① 交易點位"
+entryTime  = input.time(0, "進場點", confirm = true, inline = "en", group = G_LV)
+entryPrice = input.price(0, "", confirm = true, inline = "en", group = G_LV)
+slPrice    = input.price(0, "止損 SL", confirm = true, group = G_LV)
+tpPrice    = input.price(0, "止盈 TP", confirm = true, group = G_LV)
+tpMode     = input.string("依 R:R", "止盈方式", options = ["手動價格", "依 R:R"], group = G_LV, tooltip = "選「依 R:R」時，會忽略上面點選的 TP 價格")
+rrTarget   = input.float(2.0, "R:R 目標", minval = 0.1, step = 0.1, group = G_LV)
+
+// ───────── ② 風險與手數 ─────────
+G_RISK = "② 風險與手數"
+acctCcy    = input.string("USD", "帳戶幣別", group = G_RISK)
+balance    = input.float(10000, "帳戶餘額", minval = 0, group = G_RISK, tooltip = "Pine 讀不到你的帳戶，請手動填寫")
+riskMode   = input.string("% 餘額", "風險方式", options = ["% 餘額", "固定金額"], group = G_RISK)
+riskPct    = input.float(1.0, "風險 %", minval = 0, maxval = 100, step = 0.1, group = G_RISK)
+riskFixed  = input.float(100, "固定風險金額", minval = 0, group = G_RISK)
+contractIn = input.float(0, "每手合約數量（0 = 自動）", minval = 0, group = G_RISK, tooltip = "外匯自動用 100000，其他商品自動用 1。差價合約、黃金、期貨請依券商規格填寫（例如 XAUUSD 常見為 100）")
+lotStep    = input.float(0.01, "手數最小單位", minval = 0.0001, group = G_RISK)
+
+// ───────── ③ 保本 ─────────
+G_BE = "③ 保本"
+beOn     = input.bool(true, "啟用保本", group = G_BE)
+beR      = input.float(1.0, "觸發（R 倍數）", minval = 0.1, step = 0.1, group = G_BE)
+beOffset = input.float(0.0, "保本加點（pips）", step = 0.1, group = G_BE)
+
+// ───────── ④ 部分止盈 ─────────
+G_PT = "④ 部分止盈"
+ptOn  = input.bool(true, "啟用 TP1", group = G_PT)
+ptR   = input.float(1.0, "TP1（R 倍數）", minval = 0.1, step = 0.1, group = G_PT)
+ptPct = input.float(50, "TP1 平倉 %", minval = 1, maxval = 100, group = G_PT)
+
+// ───────── ⑤ 移動止損 ─────────
+G_TR = "⑤ 移動止損"
+trMode   = input.string("ATR", "方式", options = ["關閉", "ATR", "擺動高低點", "均線", "拋物線 SAR"], group = G_TR)
+trStartR = input.float(1.0, "啟動（R 倍數）", minval = 0, step = 0.1, group = G_TR)
+atrLen   = input.int(14, "ATR 週期", minval = 1, group = G_TR)
+atrMult  = input.float(2.0, "ATR 倍數", minval = 0.1, step = 0.1, group = G_TR)
+swLen    = input.int(10, "擺動回看 K 數", minval = 2, group = G_TR)
+maLen    = input.int(20, "均線週期", minval = 1, group = G_TR)
+maType   = input.string("EMA", "均線類型", options = ["EMA", "SMA"], group = G_TR)
+sarStart = input.float(0.02, "SAR 起始", step = 0.01, group = G_TR)
+sarInc   = input.float(0.02, "SAR 增量", step = 0.01, group = G_TR)
+sarMax   = input.float(0.2, "SAR 最大", step = 0.01, group = G_TR)
+
+// ───────── ⑥ 顯示 ─────────
+G_UI = "⑥ 顯示"
+extendBars = input.int(30, "區塊往右延伸 K 數", minval = 1, group = G_UI)
+tblPosStr  = input.string("右上", "面板位置", options = ["右上", "右下", "左上", "左下"], group = G_UI)
+cProfit    = input.color(color.new(color.teal, 82), "獲利區", group = G_UI)
+cLoss      = input.color(color.new(color.red, 82), "虧損區", group = G_UI)
+cStop      = input.color(color.orange, "目前止損線", group = G_UI)
+
+// ───────── 基本計算 ─────────
+isLong    = entryPrice > slPrice
+dir       = isLong ? 1.0 : -1.0
+riskDist  = math.abs(entryPrice - slPrice)
+validPlan = entryPrice > 0 and slPrice > 0 and riskDist > 0
+tp        = tpMode == "依 R:R" ? entryPrice + dir * riskDist * rrTarget : tpPrice
+rr        = validPlan ? (tp - entryPrice) * dir / riskDist : na
+tpValid   = validPlan and rr > 0
+tp1       = entryPrice + dir * riskDist * ptR
+beTrig    = entryPrice + dir * riskDist * beR
+pip       = syminfo.type == "forex" ? syminfo.mintick * 10 : syminfo.mintick
+
+contract  = contractIn > 0 ? contractIn : (syminfo.type == "forex" ? 100000.0 : 1.0)
+fxRaw     = request.currency_rate(syminfo.currency, acctCcy, ignore_invalid_currency = true)
+fxOk      = not na(fxRaw)
+fxRate    = fxOk ? fxRaw : 1.0
+
+// 1 手在「進場到 SL」這段距離的虧損（帳戶幣別）
+lossPerLot = riskDist * contract * syminfo.pointvalue * fxRate
+riskAmt    = riskMode == "% 餘額" ? balance * riskPct / 100 : riskFixed
+lotsRaw    = lossPerLot > 0 ? riskAmt / lossPerLot : na
+lots       = na(lotsRaw) ? na : math.floor(lotsRaw / lotStep + 1e-9) * lotStep   // 加 1e-9 避免浮點誤差把 0.5 算成 0.49
+actualRisk = lots * lossPerLot
+rewardAmt  = lots * math.abs(tp - entryPrice) * contract * syminfo.pointvalue * fxRate
+
+// ───────── 移動止損候選值 ─────────
+atrV  = ta.atr(atrLen)
+swLo  = ta.lowest(low, swLen)
+swHi  = ta.highest(high, swLen)
+maV   = maType == "EMA" ? ta.ema(close, maLen) : ta.sma(close, maLen)
+sarV  = ta.sar(sarStart, sarInc, sarMax)
+trailCand = switch trMode
+    "ATR"        => isLong ? close - atrV * atrMult : close + atrV * atrMult
+    "擺動高低點"  => isLong ? swLo : swHi
+    "均線"        => maV
+    "拋物線 SAR"  => sarV
+    => na
+
+// ───────── 狀態機：0 等待進場、1 持倉中、2 止盈、3 止損/保本/移動出場 ─────────
+var int   state     = 0
+var float curStop   = na
+var float mfe       = 0.0
+var bool  beDone    = false
+var bool  ptDone    = false
+var float exitPrice = na
+
+evActivate = false
+evBE       = false
+evPT       = false
+evTrail    = false
+evTP       = false
+evSL       = false
+
+if validPlan and tpValid
+    // 先檢查出場（用前一根 K 線結束時的止損，避免未來函數）
+    if state == 1
+        hitStop = isLong ? low <= curStop : high >= curStop
+        hitTP   = isLong ? high >= tp : low <= tp
+        if hitStop
+            // 同一根 K 同時碰到 SL 和 TP 時，保守地當作先碰 SL
+            state     := 3
+            exitPrice := curStop
+            evSL      := true
+        else if hitTP
+            state     := 2
+            exitPrice := tp
+            evTP      := true
+        else
+            fav = isLong ? high - entryPrice : entryPrice - low
+            mfe := math.max(mfe, fav)
+            if ptOn and not ptDone and mfe >= ptR * riskDist
+                ptDone := true
+                evPT   := true
+            if beOn and not beDone and mfe >= beR * riskDist
+                bePx = entryPrice + dir * beOffset * pip
+                if (isLong and bePx > curStop) or (not isLong and bePx < curStop)
+                    curStop := bePx
+                beDone := true
+                evBE   := true
+            if trMode != "關閉" and mfe >= trStartR * riskDist and not na(trailCand)
+                okSide = isLong ? trailCand < close : trailCand > close
+                better = isLong ? trailCand > curStop : trailCand < curStop
+                if okSide and better
+                    curStop := trailCand
+                    evTrail := true
+    // 進場：進場時間之後，價格碰到進場價
+    if state == 0 and time >= entryTime and low <= entryPrice and high >= entryPrice
+        state      := 1
+        curStop    := slPrice
+        evActivate := true
+
+plot(state == 1 ? curStop : na, "目前止損", color = cStop, linewidth = 2, style = plot.style_linebr)
+
+// ───────── 警報（JSON 訊息，之後可直接給 webhook 用） ─────────
+f_msg(string evt, float px) =>
+    '{"event":"' + evt + '","symbol":"' + syminfo.ticker + '","side":"' + (isLong ? "buy" : "sell") +
+     '","price":' + str.tostring(px, format.mintick) + ',"lots":' + str.tostring(lots, "#.####") +
+     ',"sl":' + str.tostring(curStop, format.mintick) + ',"tp":' + str.tostring(tp, format.mintick) + '}'
+
+if evActivate
+    alert(f_msg("entry", entryPrice), alert.freq_once_per_bar_close)
+if evPT
+    alert(f_msg("partial_close_" + str.tostring(ptPct) + "pct", tp1), alert.freq_once_per_bar_close)
+if evBE
+    alert(f_msg("move_sl_breakeven", curStop), alert.freq_once_per_bar_close)
+if evTrail and not evBE
+    alert(f_msg("move_sl_trailing", curStop), alert.freq_once_per_bar_close)
+if evTP
+    alert(f_msg("take_profit", exitPrice), alert.freq_once_per_bar_close)
+if evSL
+    alert(f_msg("stop_out", exitPrice), alert.freq_once_per_bar_close)
+
+// ───────── 圖上繪製 ─────────
+var box   bProfit = na
+var box   bLoss   = na
+var line  lTP1    = na
+var line  lBE     = na
+var label labE    = na
+var label labSL   = na
+var label labTP   = na
+
+f_fmtMoney(float v) => str.tostring(v, "#,##0.00") + " " + acctCcy
+f_pips(float d) => str.tostring(d / pip, "#.0")
+
+if barstate.islast and validPlan
+    tfMs   = timeframe.in_seconds() * 1000
+    xRight = math.max(time, entryTime) + extendBars * tfMs
+    box.delete(bProfit)
+    box.delete(bLoss)
+    line.delete(lTP1)
+    line.delete(lBE)
+    label.delete(labE)
+    label.delete(labSL)
+    label.delete(labTP)
+    bProfit := box.new(entryTime, math.max(entryPrice, tp), xRight, math.min(entryPrice, tp), xloc = xloc.bar_time, bgcolor = cProfit, border_color = color.new(color.teal, 40))
+    bLoss   := box.new(entryTime, math.max(entryPrice, slPrice), xRight, math.min(entryPrice, slPrice), xloc = xloc.bar_time, bgcolor = cLoss, border_color = color.new(color.red, 40))
+    if ptOn
+        lTP1 := line.new(entryTime, tp1, xRight, tp1, xloc = xloc.bar_time, color = color.teal, style = line.style_dashed)
+    if beOn
+        lBE := line.new(entryTime, beTrig, xRight, beTrig, xloc = xloc.bar_time, color = color.gray, style = line.style_dotted)
+    labE  := label.new(xRight, entryPrice, "進場 " + str.tostring(entryPrice, format.mintick) + "｜" + str.tostring(lots, "#.##") + " 手", xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.blue, 20), textcolor = color.white, size = size.small)
+    labSL := label.new(xRight, slPrice, "SL " + str.tostring(slPrice, format.mintick) + "｜-" + f_pips(riskDist) + " pips｜-" + f_fmtMoney(actualRisk), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+    labTP := label.new(xRight, tp, "TP " + str.tostring(tp, format.mintick) + "｜+" + f_pips(math.abs(tp - entryPrice)) + " pips｜+" + f_fmtMoney(rewardAmt), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.small)
+
+// ───────── 資訊面板 ─────────
+tblPos = switch tblPosStr
+    "右下" => position.bottom_right
+    "左上" => position.top_left
+    "左下" => position.bottom_left
+    => position.top_right
+
+var table tbl = table.new(tblPos, 2, 14, bgcolor = color.new(color.black, 15), border_color = color.new(color.gray, 60), border_width = 1)
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(tbl, 0, r, k, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, r, v, text_color = vc, text_size = size.small, text_halign = text.align_right)
+
+if barstate.islast
+    table.clear(tbl, 0, 0, 1, 13)
+    if not validPlan
+        f_row(0, "交易規劃助手", "請在圖上點選進場、SL、TP", color.yellow)
+    else if not tpValid
+        f_row(0, "交易規劃助手", "TP 方向錯誤（與 SL 同側）", color.red)
+    else
+        statusTxt = switch state
+            0 => "等待進場"
+            1 => "持倉中"
+            2 => "已止盈"
+            => (exitPrice - entryPrice) * dir > 0 ? "移動止損出場（獲利）" : (exitPrice == entryPrice ? "保本出場" : "已止損")
+        f_row(0,  "方向",      isLong ? "做多 ▲" : "做空 ▼", isLong ? color.lime : color.red)
+        f_row(1,  "進場",      str.tostring(entryPrice, format.mintick), color.white)
+        f_row(2,  "止損 SL",   str.tostring(slPrice, format.mintick) + "（" + f_pips(riskDist) + " pips）", color.red)
+        f_row(3,  "止盈 TP",   str.tostring(tp, format.mintick) + "（" + f_pips(math.abs(tp - entryPrice)) + " pips）", color.lime)
+        f_row(4,  "R:R",       "1 : " + str.tostring(rr, "#.##"), color.white)
+        f_row(5,  "設定風險",  f_fmtMoney(riskAmt), color.white)
+        f_row(6,  "手數",      str.tostring(lots, "#.####"), color.yellow)
+        f_row(7,  "實際風險",  f_fmtMoney(actualRisk), color.red)
+        f_row(8,  "預估獲利",  f_fmtMoney(rewardAmt), color.lime)
+        f_row(9,  "TP1",       ptOn ? str.tostring(tp1, format.mintick) + "（平 " + str.tostring(ptPct) + "%）" + (ptDone ? " ✔" : "") : "關閉", color.teal)
+        f_row(10, "保本觸發",  beOn ? str.tostring(beTrig, format.mintick) + (beDone ? " ✔" : "") : "關閉", color.gray)
+        f_row(11, "目前止損",  state == 1 ? str.tostring(curStop, format.mintick) : "-", cStop)
+        f_row(12, "狀態",      statusTxt, color.aqua)
+        if not fxOk
+            f_row(13, "注意", "匯率換算失敗，金額以 " + syminfo.currency + " 計", color.orange)
