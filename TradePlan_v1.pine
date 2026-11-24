@@ -1,10 +1,10 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 //@version=6
-// 交易規劃助手 v1
+// 交易規劃助手 v1.1
 // 功能：圖上點選進場/SL/TP、依風險算手數、R:R 面板、保本、部分止盈、
 //       4 種移動止損（ATR / 擺動高低點 / 均線 / SAR）、觸價警報（JSON 訊息，可接 webhook）
 // 注意：Pine Script 無法直接下單，本指標只做計算、模擬與警報。
-indicator("交易規劃助手 v1", shorttitle = "TradePlan", overlay = true, max_boxes_count = 10, max_lines_count = 20, max_labels_count = 20)
+indicator("TradePlan: Position Size, Breakeven and Trailing Stop", shorttitle = "TradePlan", overlay = true, max_boxes_count = 10, max_lines_count = 20, max_labels_count = 20)
 
 // ───────── ① 交易點位（加到圖上時會要求在圖上點選） ─────────
 G_LV = "① 交易點位"
@@ -22,7 +22,7 @@ balance    = input.float(10000, "帳戶餘額", minval = 0, group = G_RISK, tool
 riskMode   = input.string("% 餘額", "風險方式", options = ["% 餘額", "固定金額"], group = G_RISK)
 riskPct    = input.float(1.0, "風險 %", minval = 0, maxval = 100, step = 0.1, group = G_RISK)
 riskFixed  = input.float(100, "固定風險金額", minval = 0, group = G_RISK)
-contractIn = input.float(0, "每手合約數量（0 = 自動）", minval = 0, group = G_RISK, tooltip = "外匯自動用 100000，其他商品自動用 1。差價合約、黃金、期貨請依券商規格填寫（例如 XAUUSD 常見為 100）")
+contractIn = input.float(0, "每手合約數量（0 = 自動）", minval = 0, group = G_RISK, tooltip = "0 = 自動：外匯用 100000，期貨用交易所的每點價值，股票與加密貨幣用 1。黃金、指數等差價合約無法自動判斷，請依券商規格填寫（例如 XAUUSD 常見為 100），沒填就不計算手數。填了數字會直接取代自動值，期貨請維持 0")
 lotStep    = input.float(0.01, "手數最小單位", minval = 0.0001, group = G_RISK)
 
 // ───────── ③ 保本 ─────────
@@ -68,20 +68,37 @@ rr        = validPlan ? (tp - entryPrice) * dir / riskDist : na
 tpValid   = validPlan and rr > 0
 tp1       = entryPrice + dir * riskDist * ptR
 beTrig    = entryPrice + dir * riskDist * beR
-pip       = syminfo.type == "forex" ? syminfo.mintick * 10 : syminfo.mintick
+// 有些資料源會把黃金、白銀歸類成外匯，這裡排除，避免套用 100000
+isMetal   = str.startswith(syminfo.ticker, "XAU") or str.startswith(syminfo.ticker, "XAG") or str.startswith(syminfo.ticker, "XPT") or str.startswith(syminfo.ticker, "XPD")
+isForex   = syminfo.type == "forex" and not isMetal
+pip       = isForex ? syminfo.mintick * 10 : syminfo.mintick
 
-contract  = contractIn > 0 ? contractIn : (syminfo.type == "forex" ? 100000.0 : 1.0)
+// 1 手在價格變動 1.0 時的損益（報價幣別）。無法確定時為 na，寧可不算也不給錯的手數
+autoUnits = switch
+    isForex => 100000.0
+    syminfo.type == "futures" => syminfo.pointvalue
+    syminfo.type == "stock" or syminfo.type == "dr" or syminfo.type == "fund" or syminfo.type == "crypto" => syminfo.pointvalue
+    => na
+units     = contractIn > 0 ? contractIn : autoUnits
+unitsOk   = not na(units)
 fxRaw     = request.currency_rate(syminfo.currency, acctCcy, ignore_invalid_currency = true)
 fxOk      = not na(fxRaw)
-fxRate    = fxOk ? fxRaw : 1.0
 
 // 1 手在「進場到 SL」這段距離的虧損（帳戶幣別）
-lossPerLot = riskDist * contract * syminfo.pointvalue * fxRate
+lossPerLot = riskDist * units * fxRaw   // units 或匯率未知時為 na，後面的手數與金額也會是 na
 riskAmt    = riskMode == "% 餘額" ? balance * riskPct / 100 : riskFixed
 lotsRaw    = lossPerLot > 0 ? riskAmt / lossPerLot : na
-lots       = na(lotsRaw) ? na : math.floor(lotsRaw / lotStep + 1e-9) * lotStep   // 加 1e-9 避免浮點誤差把 0.5 算成 0.49
+planLots   = na(lotsRaw) ? na : math.floor(lotsRaw / lotStep + 1e-9) * lotStep   // 加 1e-9 避免浮點誤差把 0.5 算成 0.49
+// 進場時鎖定手數，之後匯率變動不會讓同一筆單的手數改變
+var float posLots = na
+lots       = not na(posLots) ? posLots : planLots
 actualRisk = lots * lossPerLot
-rewardAmt  = lots * math.abs(tp - entryPrice) * contract * syminfo.pointvalue * fxRate
+rewardAmt  = lots * math.abs(tp - entryPrice) * units * fxRaw
+
+// 分批：TP1 平倉手數依最小單位捨去；不足一個單位時不分批
+lotsOk     = not na(lots) and lots > 0
+partLots   = lotsOk ? math.floor(lots * ptPct / 100 / lotStep + 1e-9) * lotStep : na
+ptPossible = ptOn and (not lotsOk or partLots > 0)
 
 // ───────── 移動止損候選值 ─────────
 atrV  = ta.atr(atrLen)
@@ -128,7 +145,7 @@ if validPlan and tpValid
         else
             fav = isLong ? high - entryPrice : entryPrice - low
             mfe := math.max(mfe, fav)
-            if ptOn and not ptDone and mfe >= ptR * riskDist
+            if ptPossible and not ptDone and mfe >= ptR * riskDist
                 ptDone := true
                 evPT   := true
             if beOn and not beDone and mfe >= beR * riskDist
@@ -147,28 +164,48 @@ if validPlan and tpValid
     if state == 0 and time >= entryTime and low <= entryPrice and high >= entryPrice
         state      := 1
         curStop    := slPrice
+        posLots    := lots
         evActivate := true
+        // 進場同一根 K 的止損：之後的 K 棒碰到 SL 就保守視為止損；
+        // 你點選的那根 K 棒分不出 SL 是在下單前還是下單後碰到，收盤超過 SL 才算
+        slTouched = isLong ? low <= slPrice : high >= slPrice
+        slClosed  = isLong ? close <= slPrice : close >= slPrice
+        if time > entryTime ? slTouched : slClosed
+            state     := 3
+            exitPrice := slPrice
+            evSL      := true
 
 plot(state == 1 ? curStop : na, "目前止損", color = cStop, linewidth = 2, style = plot.style_linebr)
 
 // ───────── 警報（JSON 訊息，之後可直接給 webhook 用） ─────────
-f_msg(string evt, float px) =>
+// lots = 這個事件要處理的手數；remaining_lots = 事件之後剩下的手數；算不出手數時兩者為 null、size_ok 為 false
+remLots = ptDone and lotsOk ? lots - partLots : lots
+
+f_num(float v) => na(v) ? "null" : str.tostring(v, "0.########")
+
+f_msg(string evt, float px, float qty, float remain) =>
     '{"event":"' + evt + '","symbol":"' + syminfo.ticker + '","side":"' + (isLong ? "buy" : "sell") +
-     '","price":' + str.tostring(px, format.mintick) + ',"lots":' + str.tostring(lots, "#.####") +
+     '","price":' + str.tostring(px, format.mintick) + ',"lots":' + f_num(qty) +
+     ',"remaining_lots":' + f_num(remain) + ',"size_ok":' + (lotsOk ? "true" : "false") +
      ',"sl":' + str.tostring(curStop, format.mintick) + ',"tp":' + str.tostring(tp, format.mintick) + '}'
 
+msgLots = lotsOk ? lots : na
+msgPart = lotsOk ? partLots : na
+msgRem  = lotsOk ? remLots : na
+msgZero = lotsOk ? 0.0 : na
+
 if evActivate
-    alert(f_msg("entry", entryPrice), alert.freq_once_per_bar_close)
+    alert(f_msg("entry", entryPrice, msgLots, msgLots), alert.freq_once_per_bar_close)
 if evPT
-    alert(f_msg("partial_close_" + str.tostring(ptPct) + "pct", tp1), alert.freq_once_per_bar_close)
+    alert(f_msg("partial_close_" + str.tostring(ptPct) + "pct", tp1, msgPart, msgRem), alert.freq_once_per_bar_close)
 if evBE
-    alert(f_msg("move_sl_breakeven", curStop), alert.freq_once_per_bar_close)
+    alert(f_msg("move_sl_breakeven", curStop, msgRem, msgRem), alert.freq_once_per_bar_close)
 if evTrail and not evBE
-    alert(f_msg("move_sl_trailing", curStop), alert.freq_once_per_bar_close)
+    alert(f_msg("move_sl_trailing", curStop, msgRem, msgRem), alert.freq_once_per_bar_close)
 if evTP
-    alert(f_msg("take_profit", exitPrice), alert.freq_once_per_bar_close)
+    alert(f_msg("take_profit", exitPrice, msgRem, msgZero), alert.freq_once_per_bar_close)
 if evSL
-    alert(f_msg("stop_out", exitPrice), alert.freq_once_per_bar_close)
+    alert(f_msg("stop_out", exitPrice, msgRem, msgZero), alert.freq_once_per_bar_close)
 
 // ───────── 圖上繪製 ─────────
 var box   bProfit = na
@@ -179,7 +216,8 @@ var label labE    = na
 var label labSL   = na
 var label labTP   = na
 
-f_fmtMoney(float v) => str.tostring(v, "#,##0.00") + " " + acctCcy
+f_fmtMoney(float v) => na(v) ? "-" : str.tostring(v, "#,##0.00") + " " + acctCcy
+f_lots(float v, string fmt) => na(v) ? "-" : str.tostring(v, fmt)
 f_pips(float d) => str.tostring(d / pip, "#.0")
 
 if barstate.islast and validPlan
@@ -198,9 +236,9 @@ if barstate.islast and validPlan
         lTP1 := line.new(entryTime, tp1, xRight, tp1, xloc = xloc.bar_time, color = color.teal, style = line.style_dashed)
     if beOn
         lBE := line.new(entryTime, beTrig, xRight, beTrig, xloc = xloc.bar_time, color = color.gray, style = line.style_dotted)
-    labE  := label.new(xRight, entryPrice, "進場 " + str.tostring(entryPrice, format.mintick) + "｜" + str.tostring(lots, "#.##") + " 手", xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.blue, 20), textcolor = color.white, size = size.small)
-    labSL := label.new(xRight, slPrice, "SL " + str.tostring(slPrice, format.mintick) + "｜-" + f_pips(riskDist) + " pips｜-" + f_fmtMoney(actualRisk), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
-    labTP := label.new(xRight, tp, "TP " + str.tostring(tp, format.mintick) + "｜+" + f_pips(math.abs(tp - entryPrice)) + " pips｜+" + f_fmtMoney(rewardAmt), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.small)
+    labE  := label.new(xRight, entryPrice, "進場 " + str.tostring(entryPrice, format.mintick) + "｜" + f_lots(lots, "0.####") + " 手", xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.blue, 20), textcolor = color.white, size = size.small)
+    labSL := label.new(xRight, slPrice, "SL " + str.tostring(slPrice, format.mintick) + "｜-" + f_pips(riskDist) + " pips｜" + (na(actualRisk) ? "-" : "-" + f_fmtMoney(actualRisk)), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+    labTP := label.new(xRight, tp, "TP " + str.tostring(tp, format.mintick) + "｜+" + f_pips(math.abs(tp - entryPrice)) + " pips｜" + (na(rewardAmt) ? "-" : "+" + f_fmtMoney(rewardAmt)), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.small)
 
 // ───────── 資訊面板 ─────────
 tblPos = switch tblPosStr
@@ -233,12 +271,14 @@ if barstate.islast
         f_row(3,  "止盈 TP",   str.tostring(tp, format.mintick) + "（" + f_pips(math.abs(tp - entryPrice)) + " pips）", color.lime)
         f_row(4,  "R:R",       "1 : " + str.tostring(rr, "#.##"), color.white)
         f_row(5,  "設定風險",  f_fmtMoney(riskAmt), color.white)
-        f_row(6,  "手數",      str.tostring(lots, "#.####"), color.yellow)
+        f_row(6,  "手數",      f_lots(lots, "0.####"), color.yellow)
         f_row(7,  "實際風險",  f_fmtMoney(actualRisk), color.red)
         f_row(8,  "預估獲利",  f_fmtMoney(rewardAmt), color.lime)
-        f_row(9,  "TP1",       ptOn ? str.tostring(tp1, format.mintick) + "（平 " + str.tostring(ptPct) + "%）" + (ptDone ? " ✔" : "") : "關閉", color.teal)
+        f_row(9,  "TP1",       ptOn ? str.tostring(tp1, format.mintick) + "（平 " + str.tostring(ptPct) + "%）" + (ptDone ? " ✔" : ptPossible ? "" : " 手數太小") : "關閉", color.teal)
         f_row(10, "保本觸發",  beOn ? str.tostring(beTrig, format.mintick) + (beDone ? " ✔" : "") : "關閉", color.gray)
         f_row(11, "目前止損",  state == 1 ? str.tostring(curStop, format.mintick) : "-", cStop)
         f_row(12, "狀態",      statusTxt, color.aqua)
-        if not fxOk
-            f_row(13, "注意", "匯率換算失敗，金額以 " + syminfo.currency + " 計", color.orange)
+        // 手數不能用時明確說明原因，不顯示可能錯誤的數字
+        warn = not unitsOk ? "請在設定②填「每手合約數量」" : not fxOk ? "匯率換算失敗，請改帳戶幣別" : not lotsOk ? "風險金額不足最小手數" : ""
+        if warn != ""
+            f_row(13, "⚠ 注意", warn, color.orange)
